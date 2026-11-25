@@ -16,6 +16,7 @@
 <meta property="og:description" content="Ijodiy tanlovlar va jurnal platformasi: maqola, tezis, taqdimot, rasm va video.">
 <meta property="og:url" content="https://killer000004.github.io/INSON-VA-FENOMEN/">
 <meta property="og:locale" content="uz_UZ">
+<script src="https://cdn.jsdelivr.net/npm/fflate@0.8.2/umd/index.js"></script>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@400;500&family=Inter:wght@400;500;600&display=swap">
 <style>
 :root{--bg:#F1EEE6;--panel:#FAF8F3;--card:#fff;--border:#E2DDD1;--text:#1B1B1F;--muted:#6B6A66;--blue:#2F55D4;--orange:#BE5430;--red:#C0392B;--green:#2E7D4F;color-scheme:light}
@@ -100,7 +101,8 @@ select::-ms-expand{display:none}
 <script>
 // ====== Apps Script Web App URL (Deploy qilingandan keyin qo'ying) ======
 const API="https://script.google.com/macros/s/AKfycbygWMJbudl7rEkt4eq_IvNz4oyjQ6qOlMrG6vJ48b95MJiD2vWa8jB6KLOKjA7v1Hf7/exec";
-const MAX_MB=25;
+const MAX_MB=150; // Code.gs dagi MAX_MB bilan bir xil bo'lsin
+const CHUNK=8*1024*1024; // har bir bo'lak 8 MB (256 KB ga karrali bo'lishi shart)
 // O'zbekiston mobil operator kodlari (+998 dan keyingi 2 raqam). Yangi kod chiqsa shu yerga qo'shing (Code.gs da ham!)
 const UZ_CODES=["20","33","50","70","77","80","87","88","90","91","93","94","95","97","98","99"];
 
@@ -358,19 +360,49 @@ function fileChanged(){
   if(f&&!fileOk(f,c)){el.value="";$("u-err").textContent=`${CATS[c][0]} uchun ${CAT_FILES[c].hint} yuklanadi`}else $("u-err").textContent="";
 }
 const toB64=f=>new Promise((ok,no)=>{const r=new FileReader();r.onload=()=>ok(String(r.result).split(",")[1]);r.onerror=()=>no(new Error("Faylni o‘qib bo‘lmadi"));r.readAsDataURL(f)});
+// Faylni 8 MB lik bo'laklarda Drive'ga yuboradi; har bir bo'lak 3 martagacha qayta uriniladi
+async function sendFile(blob,name,mime,kind,cat,onp){
+  const s=await A("upStart",{name,mime,size:blob.size,kind,cat},true);
+  for(let off=0;off<blob.size;){
+    const part=blob.slice(off,off+CHUNK),data=await toB64(part);
+    for(let t=1;;t++){
+      try{await A("upChunk",{up:s.up,offset:off,data},true);break}
+      catch(e){if(t>=3||/sessiya|Sessiya/.test(e.message))throw e;await new Promise(r=>setTimeout(r,1500*t))}
+    }
+    off+=part.size;onp(part.size);
+  }
+  return s.up;
+}
+// Brauzerda ZIP qilish (rasm/video siqilmaydi — tezroq)
+async function makeZip(f,c){
+  const u8=new Uint8Array(await f.arrayBuffer());
+  const level=(c=="video"||c=="rasm")?0:6;
+  const z=await new Promise((ok,no)=>fflate.zip({[f.name]:[u8,{level}]},(e,d)=>e?no(e):ok(d)));
+  return new Blob([z],{type:"application/zip"});
+}
 async function submitWork(){
   const title=$("u-title").value.trim(),c=$("u-cat").value,comp=$("u-comp").value,f=$("u-file").files[0],err=t=>$("u-err").textContent=t;
   if(!title) return err("Sarlavha kiriting");
   if(!f) return err("Fayl tanlang");
   if(!fileOk(f,c)) return err(`${CATS[c][0]} uchun ${CAT_FILES[c].hint} yuklanadi`);
-  if(f.size>MAX_MB*1024*1024) return err(`Fayl ${MAX_MB} MB dan katta`);
-  const b=$("u-btn");b.disabled=true;b.textContent="Yuborilmoqda…";
+  if(f.size>MAX_MB*1024*1024) return err(`Fayl ${MAX_MB} MB dan katta (${Math.round(f.size/1048576)} MB)`);
+  if(typeof fflate=="undefined") return err("Sahifa to‘liq yuklanmadi, yangilang (F5)");
+  const b=$("u-btn"),lock=v=>{b.disabled=v;["u-title","u-cat","u-comp","u-file"].forEach(i=>$(i).disabled=v)};
+  lock(true);err("");
+  window.onbeforeunload=()=>"Fayl yuklanmoqda";
   try{
-    await A("upload",{title,cat:c,comp,name:f.name,mime:f.type,data:await toB64(f)});
+    b.textContent="Tayyorlanmoqda…";
+    const zip=await makeZip(f,c),total=f.size+zip.size;let sent=0;
+    const onp=n=>{sent+=n;b.textContent=`Yuklanmoqda… ${Math.floor(sent/total*100)}%`};
+    const base=f.name.replace(/\.[^.]+$/,"");
+    const zipUp=await sendFile(zip,base+".zip","application/zip","zip",c,onp);
+    const origUp=await sendFile(f,f.name,f.type,"orig",c,onp);
+    b.textContent="Saqlanmoqda…";
+    await A("upload",{title,cat:c,comp,zipUp,origUp},true);
     tab="me";await loadFeed();
-  }catch(e){err(e.message);b.disabled=false;b.textContent="Yuklash"}
+  }catch(e){err(e.message);b.textContent="Yuklash";lock(false)}
+  finally{window.onbeforeunload=null}
 }
-
 const SL={pending:"Kutilmoqda",approved:"Tasdiqlangan",rejected:"Rad etilgan"},SC={pending:"#77746B",approved:"#2E7D4F",rejected:"#C0392B"};
 function profileView(){
   const mine=posts.filter(p=>p.user==me),lk=mine.reduce((a,p)=>a+p.likes.length,0);
